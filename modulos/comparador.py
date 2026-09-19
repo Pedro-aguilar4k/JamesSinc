@@ -1,6 +1,8 @@
 import pandas as pd
 import re
 import os
+import unicodedata
+
 
 
 # =========================================================
@@ -40,6 +42,13 @@ def normalizar_texto(texto):
 
     texto = str(texto).strip().upper()
 
+    texto = unicodedata.normalize("NFKD", texto)
+    texto = "".join(
+        caractere
+        for caractere in texto
+        if not unicodedata.combining(caractere)
+    )
+
     texto = re.sub(
         r"\s+",
         " ",
@@ -47,6 +56,7 @@ def normalizar_texto(texto):
     )
 
     return texto.strip()
+
 
 
 # =========================================================
@@ -300,15 +310,13 @@ def converter_preco(valor):
     if valor == "":
         return None
 
-    valor = valor.replace(
-        "R$",
-        ""
-    )
+    valor = valor.upper().replace("R$", "")
+    valor = valor.replace(" ", "")
+    valor = re.sub(r"[^0-9,.-]", "", valor)
 
-    valor = valor.replace(
-        " ",
-        ""
-    )
+    if valor.count("-") > 0 and not valor.startswith("-"):
+        return None
+
 
     # -----------------------------------------------------
     # FORMATO BRASILEIRO
@@ -390,24 +398,34 @@ def comparar(
 
     fornecedores_normalizados = []
 
-    for arquivo_fornecedor in fornecedores.keys():
+    # Indexa cada cotação uma única vez. O código anterior percorria
+    # todas as linhas de todos os fornecedores para cada item do pedido,
+    # o que fazia o worker do Render atingir o timeout em planilhas maiores.
+    fornecedores_indexados = {}
 
-        nome_fornecedor = (
-            limpar_nome_fornecedor(
-                arquivo_fornecedor
-            )
-        )
+    for arquivo_fornecedor, df_fornecedor in fornecedores.items():
 
-        fornecedores_normalizados.append(
-            (
-                arquivo_fornecedor,
-                nome_fornecedor
-            )
-        )
+        nome_fornecedor = limpar_nome_fornecedor(arquivo_fornecedor)
+        fornecedores_normalizados.append((arquivo_fornecedor, nome_fornecedor))
+        totais[nome_fornecedor] = 0.0
 
-        totais[
-            nome_fornecedor
-        ] = 0.0
+        por_referencia = {}
+        linhas = []
+
+        for indice, produto in df_fornecedor.iterrows():
+            descricao = produto.get("Descrição", "")
+            descricao_normalizada = normalizar_texto(descricao)
+            entrada = (indice, produto, descricao_normalizada)
+            linhas.append(entrada)
+
+            for referencia_fornecedor in extrair_referencias(descricao):
+                por_referencia.setdefault(referencia_fornecedor, []).append(entrada)
+
+        fornecedores_indexados[arquivo_fornecedor] = {
+            "por_referencia": por_referencia,
+            "linhas": linhas,
+        }
+
 
     # =====================================================
     # PERCORRE TODOS OS ITENS DO PEDIDO
@@ -484,12 +502,16 @@ def comparar(
                 quantidade
             )
 
+            if pd.isna(quantidade) or quantidade < 0:
+                quantidade = 0.0
+
         except (
             ValueError,
             TypeError
         ):
 
             quantidade = 0.0
+
 
         # =================================================
         # GUARDA OS PREÇOS VÁLIDOS
@@ -506,38 +528,42 @@ def comparar(
             nome_fornecedor
         ) in fornecedores_normalizados:
 
-            df_fornecedor = fornecedores[
-                arquivo_fornecedor
-            ]
+            indice_fornecedor = fornecedores_indexados[arquivo_fornecedor]
+            por_referencia = indice_fornecedor["por_referencia"]
+            linhas_fornecedor = indice_fornecedor["linhas"]
 
             precos_encontrados = []
-
             produtos_encontrados = []
 
-            # ---------------------------------------------
-            # PROCURA TODAS AS LINHAS DO FORNECEDOR
-            # ---------------------------------------------
+            # Primeiro consulta o índice de referências exatas. O fallback
+            # mantém a compatibilidade com descrições em formatos incomuns.
+            referencias_item = [
+                parte.strip()
+                for parte in re.split(r"[/;,]+", referencia)
+                if parte.strip()
+            ]
+            candidatos = []
+            vistos = set()
 
-            for indice, produto in df_fornecedor.iterrows():
+            for referencia_item in referencias_item:
+                for entrada in por_referencia.get(referencia_item, []):
+                    if entrada[0] not in vistos:
+                        candidatos.append(entrada)
+                        vistos.add(entrada[0])
 
-                descricao_fornecedor = produto.get(
-                    "Descrição",
-                    ""
-                )
+            if not candidatos:
+                candidatos = linhas_fornecedor
+
+            for indice, produto, descricao_normalizada in candidatos:
 
                 if not referencias_sao_iguais(
                     referencia,
-                    descricao_fornecedor
+                    descricao_normalizada
                 ):
-
                     continue
 
-                preco = converter_preco(
-                    produto.get(
-                        "Preço",
-                        ""
-                    )
-                )
+                preco = converter_preco(produto.get("Preço", ""))
+
 
                 # PREÇO ZERO / VAZIO / NEGATIVO
                 # NÃO PARTICIPA DA COMPARAÇÃO
